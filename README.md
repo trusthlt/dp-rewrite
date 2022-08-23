@@ -4,6 +4,26 @@
 
 DP-Rewrite consists of command-line tools (later APIs) to easily perform differentially private text rewriting on a given dataset. Implemented with [PyTorch](https://pytorch.org/), our library provides models and out-of-the-box datasets for running experiments with [differential privacy](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/dwork.pdf) to provide rigorous privacy guarantees. Concretely, we provide tools for pre-training a text rewriting model (most commonly an [autoencoder](https://en.wikipedia.org/wiki/Autoencoder)), rewriting a dataset with differential privacy using this pre-trained model, and running downstream experiments on original and rewritten datasets. Additionally, our library allows for the seamless incorporation of custom datasets and custom models into the framework.
 
+## Citation
+
+Please use the following citation
+
+```plain
+@InProceedings{Igamberdiev.2022.COLING,
+    title     = {{DP-Rewrite: Towards Reproducibility and Transparency
+                  in Differentially Private Text Rewriting}},
+    author    = {Igamberdiev, Timour and Arnold, Thomas and
+                 Habernal, Ivan},
+    publisher = {International Committee on Computational
+                 Linguistics},
+    booktitle = {Proceedings of the 29th International Conference
+                 on Computational Linguistics},
+    pages     = {(to appear)},
+    year      = {2022},
+    address   = {Gyeongju, Republic of Korea}
+}
+```
+
 ## Installation
 
 ```bash
