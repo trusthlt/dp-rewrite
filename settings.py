@@ -36,6 +36,8 @@ def parse_arguments():
                            help='mode=pretrain: Which dataset will be used for training the autoencoder. '
                                 'mode=rewrite: Which dataset will be rewritten. '
                                 'mode=downstream: Which dataset the downstream task will be trained on.')
+#                                'Can include multiple datasets from the huggingface datasets library by specifying: '
+#                                'huggingface_multiple_dataset1_dataset2')
     argparser.add_argument("--model", type=str, default='adept',
                            help="Model to run, must match the specified mode (see list of models in README). (Currently only have 'adept' for pre-training/rewriting and 'bert_downstream' for downstream classification.)")
 
@@ -81,6 +83,7 @@ def parse_arguments():
     argparser.add_argument("--custom_train_path", type=str, default=None, help='Where to look for a custom datasets (train partition), if not using one of the prepared datasets for the framework.')
     argparser.add_argument("--custom_valid_path", type=str, default=None, help='Where to look for a custom datasets (optional validation partition), if not using one of the prepared datasets for the framework. If not supplied for pre-training, validation set will be created from a random split of the train partition.')
     argparser.add_argument("--custom_test_path", type=str, default=None, help='Where to look for a custom datasets (optional test partition), if not using one of the prepared datasets for the framework.')
+    argparser.add_argument("--downstream_test_data", type=str, default=None, help='Will determine a test set to load from one of the datasets of the framework (downstream mode only, when loading a training/validation dataset from custom paths).')
 
     # optional, general params: datasets
     argparser.add_argument("--prepend_labels", type=str2bool, nargs='?',
@@ -89,6 +92,10 @@ def parse_arguments():
                                 'of each sequence.')
     argparser.add_argument("--train_ratio", type=float, default=0.8,
                            help='Training dataset size ratio for train/validation split (pretrain/downstream modes only). Not used if custom dataset specified with a path for the validation set.')
+    argparser.add_argument("--length_threshold", type=int, default=None,
+                           help='An optional value by which to subsample a dataset to only include document that are originally below a certain number of tokens (based on a split by whitespace for each document).')
+    argparser.add_argument("--custom_preprocessor", type=str2bool, nargs='?',
+                           const=True, default=False, help='Whether to use a custom preprocessor instead of one of the built-in ones.')
     argparser.add_argument("--last_checkpoint_path", type=str, default='',
                            help='Global path of the checkpoint that should be used. '
                                 'Pretrain mode will use this to resume training. '
@@ -105,6 +112,8 @@ def parse_arguments():
     argparser.add_argument("--patience", type=int, default=20)
     argparser.add_argument("--optim_type", type=str, default='adam',
                            help='sgd or adam')
+    argparser.add_argument("--two_optimizers", type=str2bool, nargs='?',
+                           const=True, default=True, help='Requires for the specified model to have distinct "encoder" and "decoder" components.')
     argparser.add_argument("--hidden_size", type=int, default=768)
     argparser.add_argument("--enc_out_size", type=int, default=128,
                            help='Specific to RNN models.')
@@ -123,13 +132,16 @@ def parse_arguments():
     argparser.add_argument("--epsilon", type=float, default=1)
     argparser.add_argument("--delta", type=float, default=1e-5)
     argparser.add_argument("--clipping_constant", type=float, default=1.)
+    argparser.add_argument("--save_initial_model", type=str2bool, nargs='?', const=True, default=False, help='Whether to save a checkpoint of the model before starting the training procedure (pre-training mode only). For convenient comparison of rewriting capabilities for models that were not locally pre-trained. Model will not be saved if loading from an existing checkpoint.')
     argparser.add_argument("--dp_mechanism", type=str, default='laplace', help='laplace or gaussian.'
                             'Has no effect as of now.')
+    argparser.add_argument("--dp_module", type=str, default='clip_norm', help='The type of DP module to be applied, specific to certain autoencoder models. Relevant arguments to be specified for each specific module.')
     argparser.add_argument("--l_norm", type=int, default=2, help='Pass 2 for L2 norm, 1 for L1 norm.'
                             'Original adept uses the L2-norm (default value of this param) '
                             '(which is one of the reasons why Adept is not DP, cf. '
-                            'http://dx.doi.org/10.18653/v1/2021.emnlp-main.114).')
+                            'http://dx.doi.org/10.18653/v1/2021.emnlp-main.114). Used in the "clip_norm" dp_module')
     argparser.add_argument("--no_clipping", type=str2bool, nargs='?', const=True, default=False, help='Whether or not to clip encoder hidden states in the non-private setting.')
+    argparser.add_argument("--custom_model_arguments", nargs='*', help='Additional optional arguments for a custom model, no upper limit on the number.')
 
     args = argparser.parse_args()
 

@@ -1,3 +1,4 @@
+from models.autoencoders.general_classes import Autoencoder_RNN, GeneralModelConfig
 import copy
 from copy import deepcopy
 import torch
@@ -13,46 +14,41 @@ from tqdm import tqdm
 from abc import ABC, abstractmethod
 
 
-class Autoencoder_RNN(nn.Module):
-    def __init__(self, max_seq_len, batch_size, hidden_size, enc_out_size,
-                 vocab_size, embed_size=300, pad_idx=0, local=False,
-                 device='cpu'):
-        super().__init__()
-        self.max_seq_len = max_seq_len
-        self.batch_size = batch_size
-        self.hidden_size = hidden_size
-        self.enc_out_size = enc_out_size
+class ADePTModelConfig(GeneralModelConfig):
+    def __init__(self, pretrained_embeddings=None, vocab_size=20000,
+                 no_clipping=False, **kwargs):
+        super().__init__(**kwargs)
+        self.pretrained_embeddings = pretrained_embeddings
         self.vocab_size = vocab_size
-        self.embed_size = embed_size
-        self.pad_idx = pad_idx
-
-        self.local = local
-        self.device = device
-
-    def forward(self):
-        raise NotImplementedError
+        self.no_clipping = no_clipping
 
 
 class ADePT(Autoencoder_RNN):
-    def __init__(self, pretrained_embeddings, *args, private=False,
-                 dp_mechanism='laplace', clipping_constant=1, epsilon=1,
-                 delta=1e-5, norm_ord=1, no_clipping=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.encoder = Encoder(pretrained_embeddings, self.embed_size, self.hidden_size,
-                               self.enc_out_size, self.vocab_size, batch_size=self.batch_size, num_layers=1, dropout=0.0, pad_idx=self.pad_idx)
-        self.decoder = Decoder(pretrained_embeddings, self.embed_size, self.hidden_size,
-                               self.enc_out_size, self.vocab_size, device=self.device,
-                               batch_size=self.batch_size, num_layers=1, dropout=0.0, pad_idx=self.pad_idx)
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.encoder = self.get_encoder()
+        self.decoder = self.get_decoder()
 
-        self.private = private
-        self.clipping_constant = clipping_constant
-        self.epsilon = epsilon
-        self.delta = delta
-        self.norm_ord = norm_ord
-        self.no_clipping = no_clipping
-        self.dp_mechanism = dp_mechanism
+    def get_encoder(self):
+        encoder = Encoder(
+            self.config.pretrained_embeddings,
+            self.config.embed_size, self.config.hidden_size,
+            self.config.enc_out_size, self.config.vocab_size,
+            batch_size=self.config.batch_size, num_layers=1, dropout=0.0,
+            pad_idx=self.config.pad_idx)
+        return encoder
 
-    def forward(self, inputs, lengths, teacher_forcing_ratio=0.5):
+    def get_decoder(self):
+        decoder = Decoder(
+            self.config.pretrained_embeddings, self.config.embed_size,
+            self.config.hidden_size, self.config.enc_out_size,
+            self.config.vocab_size, device=self.config.device,
+            batch_size=self.config.batch_size, num_layers=1, dropout=0.0,
+            pad_idx=self.config.pad_idx)
+        return decoder
+
+    def forward(self, **inputs):
         '''
         Input:
             inputs: batch_size X seq_len
@@ -61,28 +57,34 @@ class ADePT(Autoencoder_RNN):
             z: batch_size X seq_len X vocab_size+4
             enc_embed: batch_size X seq_len X embed_size
         '''
+        input_ids = inputs['input_ids']
+        lengths = inputs['lengths']
+        teacher_forcing_ratio = inputs['teacher_forcing_ratio']
         encoder_hidden = self.encoder.initHidden()
-        encoder_hidden = (encoder_hidden[0].to(self.device),
-                          encoder_hidden[1].to(self.device))
+        encoder_hidden = (encoder_hidden[0].to(self.config.device),
+                          encoder_hidden[1].to(self.config.device))
 
-        encoder_out, encoder_hidden = self.encoder(inputs, lengths,
+        encoder_out, encoder_hidden = self.encoder(input_ids, lengths,
                                                    encoder_hidden)
 
         ## Privacy module
         context_vec = torch.cat((encoder_hidden[0], encoder_hidden[1]), dim=2)
-        if self.private:
+        if self.config.private:
             context_vec = self.privatize(context_vec)
         else:
-            if not self.no_clipping:
+            if not self.config.no_clipping:
                 # ADePT model clips without privacy to encourage model
                 # representations to be within a radius of C
                 context_vec = self.clip(context_vec)
-        encoder_hidden = (context_vec[:, :, :self.hidden_size].contiguous(),
-                          context_vec[:, :, self.hidden_size:].contiguous())
+        encoder_hidden = (
+            context_vec[:, :, :self.config.hidden_size].contiguous(),
+            context_vec[:, :, self.config.hidden_size:].contiguous()
+            )
 
-        target = deepcopy(inputs)
-        z = torch.zeros(self.max_seq_len, inputs.shape[0], self.vocab_size)
-        z = z.to(self.device)
+        target = deepcopy(input_ids)
+        z = torch.zeros(self.config.max_seq_len, input_ids.shape[0],
+                        self.config.vocab_size)
+        z = z.to(self.config.device)
         prev_x = target[:, 0]
         prev_x = prev_x.unsqueeze(0)
 
@@ -90,12 +92,12 @@ class ADePT(Autoencoder_RNN):
 
         teacher_force = random.random() < teacher_forcing_ratio
         if teacher_force:
-            for i in range(1, self.max_seq_len):
+            for i in range(1, self.config.max_seq_len):
                 z_i, decoder_hidden = self.decoder(prev_x, decoder_hidden)
                 prev_x = target[:, i].unsqueeze(dim=0)
                 z[i] = z_i
         else:
-            for i in range(1, self.max_seq_len):
+            for i in range(1, self.config.max_seq_len):
                 z_i, decoder_hidden = self.decoder(prev_x, decoder_hidden)
                 top_idxs = z_i.argmax(1)
                 prev_x = top_idxs.unsqueeze(dim=0)
@@ -110,32 +112,44 @@ class ADePT(Autoencoder_RNN):
         return noisified
 
     def clip(self, context_vec):
-        norm = torch.linalg.norm(context_vec, axis=2, ord=self.norm_ord)
-        ones = torch.ones(norm.shape[1]).to(self.device)
-        min_val = torch.minimum(ones, self.clipping_constant / norm)
+        norm = torch.linalg.norm(context_vec, axis=2, ord=self.config.norm_ord)
+        ones = torch.ones(norm.shape[1]).to(self.config.device)
+        min_val = torch.minimum(ones, self.config.clipping_constant / norm)
         clipped = min_val.unsqueeze(-1) * context_vec
         return clipped
 
-    def noisify(self, clipped_tensor, context_vec):
-        if self.norm_ord == 1:
-            sensitivity = torch.tensor(2 * self.clipping_constant)
-        elif self.norm_ord == 2:
-            sensitivity = 2 * self.clipping_constant * torch.sqrt(
+    def get_sensitivity_for_clip_by_norm(self, clipped_tensor):
+        if self.config.norm_ord == 1 and self.config.dp_mechanism == 'laplace':
+            sensitivity = torch.tensor(2 * self.config.clipping_constant)
+        elif self.config.norm_ord == 2 and\
+                self.config.dp_mechanism == 'laplace':
+            sensitivity = 2 * self.config.clipping_constant * torch.sqrt(
                 torch.tensor(clipped_tensor.shape[2]))
+        elif self.config.norm_ord == 2 and\
+                self.config.dp_mechanism == 'gaussian':
+            sensitivity = torch.tensor(2 * self.config.clipping_constant)
         else:
-            raise Exception("Sensitivity calculation not implemented for norm orders other than 1 or 2.")
-        if self.dp_mechanism == 'laplace':
-            laplace = torch.distributions.Laplace(0, sensitivity / self.epsilon)
+            raise Exception("Sensitivity calculation for clipping by norm only implemented for Laplace mechanism with L1/L2 norm clipping, or Gaussian mechanism with L2 norm clipping.")
+        return sensitivity
+
+    def noisify(self, clipped_tensor, context_vec):
+        sensitivity = self.get_sensitivity_for_clip_by_norm(clipped_tensor)
+        if self.config.dp_mechanism == 'laplace':
+            laplace = torch.distributions.Laplace(
+                0, sensitivity / self.config.epsilon)
             noise = laplace.sample(
                 sample_shape=torch.Size((context_vec.shape[1],
                                          context_vec.shape[2]))).unsqueeze(0)
-        elif self.dp_mechanism == 'gaussian':
-            scale = torch.sqrt((sensitivity**2 / self.epsilon**2) * 2 * torch.log(torch.tensor(1.25 / self.delta)))
+        elif self.config.dp_mechanism == 'gaussian':
+            scale = torch.sqrt(
+                (sensitivity**2 / self.config.epsilon**2) * 2 * torch.log(torch.tensor(1.25 / self.config.delta)))
             gauss = torch.distributions.normal.Normal(0, scale)
-            noise = gauss.sample(sample_shape=torch.Size((clipped_tensor.shape[1], clipped_tensor.shape[2])))
+            noise = gauss.sample(
+                sample_shape=torch.Size((clipped_tensor.shape[1],
+                                         clipped_tensor.shape[2])))
         else:
             raise Exception(f"No DP mechanism available called '{self.dp_mechanism}'.")
-        noise = noise.to(self.device)
+        noise = noise.to(self.config.device)
         noisified = clipped_tensor + noise
         return noisified
 

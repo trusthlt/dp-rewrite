@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
-from datasets import Dataset
+from datasets import Dataset, Value
 
 import os
 import copy
 import json
+import multiprocessing
 
 import numpy as np
 import pandas as pd
@@ -11,7 +12,7 @@ import pdb
 from tqdm import tqdm
 
 import torch
-from transformers import BertTokenizer
+from transformers import AutoTokenizer
 
 from torchtext.data.utils import get_tokenizer
 from gensim.models import KeyedVectors
@@ -20,20 +21,54 @@ from utils import NpEncoder
 
 
 class Preprocessor(ABC):
+    '''
+    Description
+    -----------
+    Abstract class based on which built-in and custom preprocessors are
+    prepared.
+
+    Attributes
+    ----------
+    checkpoint_dir : str
+    max_seq_len : int
+    batch_size : int
+    prepend_labels : bool
+    length_threshold : int
+
+    Methods
+    -------
+    process_data():
+        Given a loaded dataset from HF or local path, output the preprocessed
+        dataset.
+    '''
     def __init__(self, checkpoint_dir, max_seq_len, batch_size,
-                 prepend_labels):
+                 prepend_labels, mode):
         self.checkpoint_dir = checkpoint_dir
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
         self.prepend_labels = prepend_labels
+        self.mode = mode
 
     @abstractmethod
-    def process_data(self):
+    def process_data(self, data):
+        '''
+        Description
+        -----------
+
+        Given a loaded dataset from HF or local path, output the preprocessed
+        dataset.
+
+        Parameters
+        ----------
+        data : ``Dataset``, A dataset object from HF with at least 'label' and
+               'text' columns.
+
+        '''
         pass
 
-    @abstractmethod
-    def process_data_no_embeds(self):
-        pass
+#    @abstractmethod
+#    def process_data_no_embeds(self):
+#        pass
 
 
 class Preprocessor_for_RNN(Preprocessor):
@@ -68,8 +103,12 @@ class Preprocessor_for_RNN(Preprocessor):
             embeds (np.ndarray): 2D array, of untrimmed vocabulary size X
                                  self.embed_size
         '''
-        vocab_file = os.path.join(self.embed_dir_processed, f'vocab_type{self.embed_type}_d{self.embed_size}_np.npy')
-        embeds_file = os.path.join(self.embed_dir_processed, f'embeds_type{self.embed_type}_d{self.embed_size}_np.npy')
+        vocab_file = os.path.join(
+            self.embed_dir_processed,
+            f'vocab_type{self.embed_type}_d{self.embed_size}_np.npy')
+        embeds_file = os.path.join(
+            self.embed_dir_processed,
+            f'embeds_type{self.embed_type}_d{self.embed_size}_np.npy')
 
         try:
             with open(vocab_file, 'rb') as v_f:
@@ -80,11 +119,14 @@ class Preprocessor_for_RNN(Preprocessor):
         except FileNotFoundError:
             print("Preparing vocabulary and embedding files...")
             if self.embed_type.lower() == 'glove':
-                vocab, embeds = self.make_vocab_and_embeds_glove(vocab_file, embeds_file)
+                vocab, embeds = self.make_vocab_and_embeds_glove(
+                    vocab_file, embeds_file)
             elif self.embed_type.lower() in ['word2vec', 'w2v']:
-                vocab, embeds = self.make_vocab_and_embeds_w2v(vocab_file, embeds_file)
+                vocab, embeds = self.make_vocab_and_embeds_w2v(
+                    vocab_file, embeds_file)
             else:
-                raise Exception("'embed_type' can only be 'glove', 'word2vec', or 'none'.")
+                raise Exception(
+                    "'embed_type' can only be 'glove', 'word2vec', or 'none'.")
 
         indexes = np.arange(vocab.size)
         word2idx = {}
@@ -133,8 +175,22 @@ class Preprocessor_for_RNN(Preprocessor):
 
         return vocab_np, embeds_np
 
-    def process_data(self, train_data, valid_data=None, test_data=None,
-                     rewriting=False, last_checkpoint_path=None):
+    def process_data(self, data, train_split=True, rewriting=False,
+                     last_checkpoint_path=None, first_shard=True):
+        if self.embed_type not in ['none']:
+            data = self.process_data_embeds(
+                data, train_split=train_split, rewriting=rewriting,
+                last_checkpoint_path=last_checkpoint_path,
+                first_shard=first_shard)
+        else:
+            data = self.process_data_no_embeds(
+                data, train_split=train_split, rewriting=rewriting,
+                last_checkpoint_path=last_checkpoint_path,
+                first_shard=first_shard)
+        return data
+
+    def process_data_embeds(self, data, train_split=True, rewriting=False,
+                            last_checkpoint_path=None, first_shard=True):
         '''
         Procedure:
             1. Tokenize and vectorize raw data
@@ -152,43 +208,46 @@ class Preprocessor_for_RNN(Preprocessor):
             Add both strings and indexes to self.word2idx and self.idx2word
             ...
         '''
-        if self.prepend_labels:
-            labels = [doc['label'] for doc in train_data]
+        if self.prepend_labels and train_split and first_shard:
+            labels = [doc['label'] for doc in data]
             str_labels = ['LABEL_' + str_lab
                           for str_lab in sorted(set(labels))]
-            idx_labels = np.arange(len(str_labels)) + self.vocab_size + 4
+            if first_shard:
+                idx_labels = np.arange(len(str_labels)) + self.vocab_size + 4
+            else:
+                idx_labels = np.arange(len(str_labels)) + (self.vocab_size - len(str_labels))
         else:
             idx_labels = None
 
-        train_data = self._tokenize_and_vectorize(train_data)
-        if valid_data is not None:
-            valid_data = self._tokenize_and_vectorize(valid_data)
-        if test_data is not None:
-            test_data = self._tokenize_and_vectorize(test_data)
+        data = self._tokenize_and_vectorize(data)
 
-        if rewriting:
-            try:
-                old_idx2word = copy.deepcopy(self.idx2word)
-                self.vocab, self.embeds, self.word2idx, self.idx2word =\
-                    self._load_existing_compact_embeds(last_checkpoint_path)
-            except:
-                print("Could not load existing word2idx and idx2word "
-                      "dictionaries, rebuilding based on specified dataset. "
-                      "If pre-training and rewriting on two different "
-                      "datasets, MAKE SURE the vocabularies are the same "
-                      "for both.")
-                top_idxs = self._get_frequency(train_data)
+        if first_shard and train_split:
+            if rewriting:
+                try:
+                    old_idx2word = copy.deepcopy(self.idx2word)
+                    self.vocab, self.embeds, self.word2idx, self.idx2word =\
+                        self._load_existing_compact_embeds(last_checkpoint_path)
+                except:
+                    print("Could not load existing word2idx and idx2word "
+                          "dictionaries, rebuilding based on specified dataset. "
+                          "If pre-training and rewriting on two different "
+                          "datasets, MAKE SURE the vocabularies are the same "
+                          "for both.")
+                    top_idxs = self._get_frequency(data)
+                    old_idx2word = copy.deepcopy(self.idx2word)
+                    self.vocab, self.embeds, self.word2idx, self.idx2word =\
+                        self._prepare_compact_embeds(top_idxs,
+                                                     idx_labels=idx_labels)
+            else:
+                top_idxs = self._get_frequency(data)
                 old_idx2word = copy.deepcopy(self.idx2word)
                 self.vocab, self.embeds, self.word2idx, self.idx2word =\
                     self._prepare_compact_embeds(top_idxs,
                                                  idx_labels=idx_labels)
         else:
-            top_idxs = self._get_frequency(train_data)
-            old_idx2word = copy.deepcopy(self.idx2word)
-            self.vocab, self.embeds, self.word2idx, self.idx2word =\
-                self._prepare_compact_embeds(top_idxs, idx_labels=idx_labels)
+            old_idx2word = None
 
-        if self.prepend_labels:
+        if self.prepend_labels and train_split and first_shard:
             # Add label strings and indexes to the existing word2idx and
             # idx2word dictionaries
             for idx, lab in enumerate(str_labels):
@@ -198,25 +257,24 @@ class Preprocessor_for_RNN(Preprocessor):
         else:
             len_labels = 0
 
-        train_data = self._reindex_data_and_pad(train_data, old_idx2word,
-                                                self.word2idx)
+        data = self._reindex_data_and_pad(data, self.word2idx,
+                                          old_idx2word=old_idx2word)
 
-        if valid_data is not None:
-            valid_data = self._reindex_data_and_pad(valid_data, old_idx2word,
-                                                    self.word2idx)
-        if test_data is not None:
-            test_data = self._reindex_data_and_pad(test_data, old_idx2word,
-                                                   self.word2idx)
+        if first_shard and train_split:
+            self.vocab_size = self.vocab_size + 4 + len_labels
 
-        self.vocab_size = self.vocab_size + 4 + len_labels
-
-        return train_data, valid_data, test_data
+        return data
 
     def _tokenize_and_vectorize(self, dataset):
         data = []
         for doc_dict in tqdm(dataset):
             tokenized = self.tokenizer(doc_dict['text'].strip().lower())
-            tensor = torch.tensor([self.word2idx[token] if token in self.word2idx.keys() else self.word2idx[self.UNK] for token in tokenized][:(self.max_seq_len-2)])  # -2 for SOS+EOS tokens
+            tensor = torch.tensor(
+                [self.word2idx[token]
+                 if token in self.word2idx.keys()
+                 else self.word2idx[self.UNK]
+                 for token in tokenized][:(self.max_seq_len-2)],
+                dtype=torch.long)  # -2 for SOS+EOS tokens
             length = tensor.size()[0]
             data.append((tensor, length, doc_dict['label']))
 
@@ -240,12 +298,17 @@ class Preprocessor_for_RNN(Preprocessor):
         new_vocab = np.insert(new_vocab, 2, self.SOS)
         new_vocab = np.insert(new_vocab, 3, self.EOS)
 
-        pad_emb_np = np.zeros((1, new_embeds.shape[1]))  # pad token is all 0s
-        unk_emb_np = np.mean(new_embeds, axis=0, keepdims=True)  # unk token is mean of all other embeds
-        sos_emb_np = np.random.normal(size=pad_emb_np.shape)  # sos token is a random vector (standard normal)
-        eos_emb_np = np.random.normal(size=pad_emb_np.shape)  # eos token is a random vector (standard normal)
+        # Pad token is all 0s
+        pad_emb_np = np.zeros((1, new_embeds.shape[1]))
+        # UNK token is mean of all other embeds
+        unk_emb_np = np.mean(new_embeds, axis=0, keepdims=True)
+        # SOS token is a random vector (standard normal)
+        sos_emb_np = np.random.normal(size=pad_emb_np.shape)
+        # EOS token is a random vector (standard normal)
+        eos_emb_np = np.random.normal(size=pad_emb_np.shape)
 
-        new_embeds = np.vstack((pad_emb_np, unk_emb_np, sos_emb_np, eos_emb_np, new_embeds))
+        new_embeds = np.vstack((pad_emb_np, unk_emb_np, sos_emb_np,
+                                eos_emb_np, new_embeds))
         if self.prepend_labels:
             idx_emb_nps = np.random.normal(size=(
                 len(idx_labels), pad_emb_np.shape[1]))
@@ -284,7 +347,7 @@ class Preprocessor_for_RNN(Preprocessor):
 
         return new_vocab, new_embeds, new_word2idx, new_idx2word
 
-    def _reindex_data_and_pad(self, data, old_idx2word, compact_word2idx):
+    def _reindex_data_and_pad(self, data, compact_word2idx, old_idx2word=None):
         '''
         Carries out three tasks:
         1. Converts indexes of untrimmed vocabulary to indexes of trimmed
@@ -295,12 +358,17 @@ class Preprocessor_for_RNN(Preprocessor):
         '''
         reindexed = []
         for data_point in tqdm(data):
-            old_indexes = data_point[0]
-            words = [old_idx2word[idx.item()] for idx in old_indexes]
-            new_indexes = torch.tensor(
-                    [compact_word2idx[word]
-                     if word in compact_word2idx
-                     else compact_word2idx[self.UNK] for word in words])
+            if old_idx2word is not None:
+                old_indexes = data_point[0]
+                words = [old_idx2word[idx.item()] for idx in old_indexes]
+                new_indexes = torch.tensor(
+                        [compact_word2idx[word]
+                         if word in compact_word2idx
+                         else compact_word2idx[self.UNK] for word in words],
+                        dtype=torch.long)
+            else:
+                # If subsequent shard
+                new_indexes = data_point[0]
 
             if self.prepend_labels:
                 # In case of any new labels (generally shouldn't be the case)
@@ -331,15 +399,36 @@ class Preprocessor_for_RNN(Preprocessor):
 
         return reindexed
 
-    def process_data_no_embeds(self, train_data, valid_data=None,
-                               test_data=None, last_checkpoint_path=None, rewriting=False):
+    def process_data_no_embeds(self, data, train_split=True, rewriting=False,
+                               last_checkpoint_path=None, first_shard=True):
+        # Only prepare the vocabulary based on the first shard
+        # (dataset should be large enough, e.g. Wikipedia)
+        if first_shard and train_split:
+            data = self._process_data_no_embeds_first_shard(
+                data, rewriting=rewriting,
+                last_checkpoint_path=last_checkpoint_path)
+        else:
+            data = self._process_data_no_embeds_subsequent_shard(
+                data, rewriting=rewriting,
+                last_checkpoint_path=last_checkpoint_path)
+        return data
+
+    def _process_data_no_embeds_first_shard(
+            self, data, last_checkpoint_path=None, rewriting=False):
         def encode(examples):
             examples['text'] = [self.tokenizer(doc.strip().lower())
                                 for doc in examples['text']]
             return examples
 
-        train_data = train_data.map(encode, batched=True)
-        train_labels = [val['label'] for val in train_data]
+        # Multiprocessing for larger datasets
+        threshold = 50000
+        if len(data) > threshold:
+            proc_num = os.cpu_count()
+        else:
+            proc_num = None
+
+        data = data.map(encode, batched=True, num_proc=proc_num)
+        labels = data['label']
 
         if rewriting:
             # Loading the large idx2word for the full vocab
@@ -350,7 +439,8 @@ class Preprocessor_for_RNN(Preprocessor):
                           'large_idx2word.json'), 'r',
                           encoding='utf-8') as f:
                     self.idx2word = json.load(f)
-                self.idx2word = {int(idx): token for idx, token in self.idx2word.items()}
+                self.idx2word = {int(idx): token
+                                 for idx, token in self.idx2word.items()}
             except FileNotFoundError:
                 print("Could not load existing FULL word2idx and idx2word "
                       "dictionaries, rebuilding based on specified dataset. "
@@ -358,15 +448,17 @@ class Preprocessor_for_RNN(Preprocessor):
                       "datasets, MAKE SURE the vocabularies are the same "
                       "for both.")
                 idx2word = []
-                for idx, doc in tqdm(enumerate(train_data)):
+                for idx, doc in tqdm(enumerate(data)):
                     idx2word += doc['text']
                     if idx % 5000 == 0:
                         idx2word = list(set(idx2word))
                 idx2word = list(set(idx2word))
+                self.idx2word = {idx: token
+                                 for idx, token in enumerate(idx2word)}
 
         else:
             idx2word = []
-            for idx, doc in tqdm(enumerate(train_data)):
+            for idx, doc in tqdm(enumerate(data)):
                 idx2word += doc['text']
                 if idx % 5000 == 0:
                     idx2word = list(set(idx2word))
@@ -385,30 +477,12 @@ class Preprocessor_for_RNN(Preprocessor):
 
         self.word2idx = {token: idx for idx, token in self.idx2word.items()}
 
-        # old location for prepend labels, word2idx/idx2word
+        data = data.map(self._encode, batched=True, num_proc=proc_num)
+            # does not keep torch tensor format, switches to list
 
-        train_encoded, train_lengths = self._encode(train_data)
-
-        train_data = [(indexes, length, label)
-                      for indexes, length, label in zip(
-                          train_encoded, train_lengths, train_labels
-                          )]
-        if valid_data is not None:
-            valid_data = valid_data.map(encode, batched=True)
-            valid_labels = [val['label'] for val in valid_data]
-            valid_encoded, valid_lengths = self._encode(valid_data)
-            valid_data = [(indexes, length, label)
-                          for indexes, length, label in zip(
-                              valid_encoded, valid_lengths, valid_labels
-                              )]
-        if test_data is not None:
-            test_data = test_data.map(encode, batched=True)
-            test_labels = [val['label'] for val in test_data]
-            test_encoded, test_lengths = self._encode(test_data)
-            test_data = [(indexes, length, label)
-                         for indexes, length, label in zip(
-                             test_encoded, test_lengths, test_labels
-                             )]
+        data = [(torch.tensor(indexes), length, label)
+                  for indexes, length, label in zip(
+                      data['encoded'], data['length'], data['label'])]
 
         if len(self.idx2word) < self.vocab_size:
             print(f"Specified vocabulary size as {self.vocab_size}, but number of unique words in dataset {len(self.idx2word)}. Setting vocabulary size to {len(self.idx2word)-1}.")
@@ -431,7 +505,7 @@ class Preprocessor_for_RNN(Preprocessor):
                       "If pre-training and rewriting on two different "
                       "datasets, MAKE SURE the vocabularies are the same "
                       "for both.")
-                top_indexes = self._get_frequency(train_data)
+                top_indexes = self._get_frequency(data)
                 old_idx2word = copy.deepcopy(self.idx2word)
                 reindexes = np.arange(self.vocab_size+4)
                 vocab = np.vectorize(self.idx2word.get)(top_indexes)
@@ -453,7 +527,7 @@ class Preprocessor_for_RNN(Preprocessor):
                               cls=NpEncoder)
 
         else:
-            top_indexes = self._get_frequency(train_data)
+            top_indexes = self._get_frequency(data)
             old_idx2word = copy.deepcopy(self.idx2word)
             reindexes = np.arange(self.vocab_size+4)
             vocab = np.vectorize(self.idx2word.get)(top_indexes)
@@ -476,7 +550,7 @@ class Preprocessor_for_RNN(Preprocessor):
 
         if self.prepend_labels:
             str_labels = ['LABEL_' + str(str_lab)
-                          for str_lab in sorted(set(train_labels))]
+                          for str_lab in sorted(set(labels))]
             idx_labels = np.arange(len(str_labels)) + len(self.idx2word)
             # Add label strings and indexes to the existing word2idx and
             # idx2word dictionaries
@@ -484,32 +558,43 @@ class Preprocessor_for_RNN(Preprocessor):
                 self.word2idx[lab] = idx_labels[idx]
                 self.idx2word[idx_labels[idx]] = lab
 
-        train_data = self._reindex_data_and_pad(train_data, old_idx2word,
-                                                self.word2idx)
-
-        if valid_data is not None:
-            valid_data = self._reindex_data_and_pad(valid_data, old_idx2word,
-                                                    self.word2idx)
-
-        if test_data is not None:
-            test_data = self._reindex_data_and_pad(test_data, old_idx2word,
-                                                   self.word2idx)
+        data = self._reindex_data_and_pad(data, self.word2idx,
+                                          old_idx2word=old_idx2word)
 
         self.vocab_size = len(self.idx2word)
 
-        return train_data, valid_data, test_data
+        return data
 
-    def _encode(self, dataset):
-        encoded = []
-        lengths = []
-        for idx, doc in tqdm(enumerate(dataset)):
-            doc_encoded = [self.word2idx[tok]
-                           if tok in self.word2idx
-                           else self.word2idx[self.UNK] for tok in doc['text']]
-            doc_encoded = torch.tensor(doc_encoded[:(self.max_seq_len-2)])
-            encoded.append(doc_encoded)
-            lengths.append(doc_encoded.size()[0])
-        return encoded, lengths
+    def _process_data_no_embeds_subsequent_shard(
+            self, data, last_checkpoint_path=None, rewriting=False):
+        def encode(examples):
+            examples['text'] = [self.tokenizer(doc.strip().lower())
+                                for doc in examples['text']]
+            return examples
+
+        # Multiprocessing for larger datasets
+        threshold = 50000
+        if len(data) > threshold:
+            proc_num = os.cpu_count()
+        else:
+            proc_num = None
+
+        data = data.map(encode, batched=True, num_proc=proc_num)
+        data = data.map(self._encode, batched=True)
+            # does not keep torch tensor format, switches to list
+        data = [(torch.tensor(indexes), length, label)
+                for indexes, length, label in zip(
+                    data['encoded'], data['length'], data['label'])]
+        # Only padding and adding sos/eos tokens in this case
+        data = self._reindex_data_and_pad(data, self.word2idx)
+
+        return data
+
+    def _encode(self, examples):
+        encoded = [[self.word2idx[tok] if tok in self.word2idx else self.word2idx[self.UNK] for tok in doc] for doc in examples['text']]
+        examples['encoded'] = [torch.tensor(enc_doc[:(self.max_seq_len-2)]) for enc_doc in encoded]
+        examples['length'] = [doc.size()[0] for doc in examples['encoded']]
+        return examples
 
 
 class Preprocessor_for_Transformer(Preprocessor):
@@ -518,23 +603,50 @@ class Preprocessor_for_Transformer(Preprocessor):
 
         self.transformer_type = transformer_type
 
-        self.tokenizer = BertTokenizer.from_pretrained(self.transformer_type)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.transformer_type)
 
         self.PAD = self.tokenizer.pad_token
         self.UNK = self.tokenizer.unk_token
 
         self.vocab, self.embeds, self.word2idx, self.idx2word = (None,)*4
-        self.labstr2int = None
-        self.labint2str = None
+        self.lab_str2int = None
+        self.lab_int2str = None
         self.num_labels = None
 
-    def process_data(self, train_data, valid_data=None, test_data=None):
-        sorted_labels = sorted(
-            set(train_data[idx]['label'] for idx in range(len(train_data))))
-        lab_str2int = {string: idx for idx, string in enumerate(sorted_labels)}
-        self.lab_str2int = lab_str2int
+        if self.prepend_labels:
+            raise Exception(
+                "Prepending labels not yet available for transformer-based "
+                "models.")
+
+    def process_data(self, data, train_split=True, first_shard=True):
+#        sorted_labels = sorted(
+#            set(data[idx]['label'] for idx in range(len(data))))
+        if np.count_nonzero(data['label']) == 0:
+            sorted_labels = [0.0]
+        else:
+            sorted_labels = sorted(set(
+                data[idx]['label'] for idx in range(len(data))))
+
+        if not train_split:
+            # In case of any new labels (generally shouldn't be the case)
+            sorted_val_labels = [lab for lab in sorted_labels
+                                 if lab not in self.lab_str2int]
+            for val in sorted_val_labels:
+                self.lab_str2int[val] = len(self.lab_str2int)
+        else:
+            lab_str2int = {string: idx
+                           for idx, string in enumerate(sorted_labels)}
+            self.lab_str2int = lab_str2int
+
+        lab_int2str = {val: key for key, val in self.lab_str2int.items()}
+        self.lab_int2str = lab_int2str
+        self.num_labels = len(self.lab_str2int)
 
         def encode(examples):
+            if None in examples['text']:
+                print("***** None found *****")
+                examples['text'] = [text if text is not None else ''
+                                    for text in examples['text']]
             tokenized_batch = self.tokenizer(
                 examples['text'], truncation=True,
                 max_length=self.max_seq_len, padding='max_length')
@@ -542,40 +654,27 @@ class Preprocessor_for_Transformer(Preprocessor):
                 [self.lab_str2int[lab] for lab in examples['label']]
             return tokenized_batch
 
-        train_data = self.map_data_split(train_data, encode)
-        if valid_data is not None:
-            # In case of any new labels (generally shouldn't be the case)
-            sorted_val_labels = sorted(set(valid_data[idx]['label'] for idx in range(len(valid_data))))
-            sorted_val_labels = [lab for lab in sorted_val_labels if lab not in self.lab_str2int]
-            for val in sorted_val_labels:
-                self.lab_str2int[val] = len(self.lab_str2int)
+        data = self.map_data_split(data, encode)
 
-            valid_data = self.map_data_split(valid_data, encode)
-        if test_data is not None:
-            # In case of any new labels (generally shouldn't be the case)
-            sorted_test_labels = sorted(set(test_data[idx]['label'] for idx in range(len(test_data))))
-            sorted_test_labels = [lab for lab in sorted_test_labels if lab not in self.lab_str2int]
-            for val in sorted_test_labels:
-                self.lab_str2int[val] = len(self.lab_str2int)
-
-            test_data = self.map_data_split(test_data, encode)
-
-        lab_int2str = {val: key for key, val in lab_str2int.items()}
-        self.lab_int2str = lab_int2str
-        self.num_labels = len(lab_str2int)
-
-        return train_data, valid_data, test_data
+        return data
 
     def map_data_split(self, data_split, encode):
         data_split = data_split.map(encode, batched=True)
         data_split = data_split.map(
                 lambda examples: {'labels': examples['label']}, batched=True)
         data_split = data_split.remove_columns('label')
-        data_split.set_format(type='torch', columns=['input_ids', 'token_type_ids', 'attention_mask', 'labels'])
+        data_split.set_format(
+            type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+        # Fix for occasional issue with datasets library, where long features
+        # become double after mapping
+        if not data_split.features['labels'] == Value('int64'):
+            new_features = data_split.features.copy()
+            new_features['labels'] = Value('int64')
+            data_split = data_split.cast(new_features)
         return data_split
 
-    def process_data_no_embeds(self):
-        pass
+#    def process_data_no_embeds(self):
+#        pass
 
 
 class Custom_Preprocessor(Preprocessor):

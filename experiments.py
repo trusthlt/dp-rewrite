@@ -1,3 +1,14 @@
+from dataload import DPRewriteDataset
+from models.downstream_models.bert_downstream import BertDownstream
+from utils import decode_rewritten, EarlyStopping
+from models.autoencoders.adept import ADePT, ADePTModelConfig
+from models.autoencoders.custom import CustomModel_RNN, CustomModel_Transformer, CustomModelConfig
+import matplotlib.pyplot as plt
+import pandas as pd
+import time
+import json
+from tqdm import tqdm
+from copy import deepcopy
 import os
 import tempfile
 from abc import ABC, abstractmethod
@@ -6,21 +17,15 @@ import torch
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from sklearn.metrics import precision_recall_fscore_support
 from sacrebleu.metrics import BLEU
 from bert_score import BERTScorer
 os.environ['MPLCONFIGDIR'] = os.getcwd() + '/configs/'
-import matplotlib.pyplot as plt
-import pandas as pd
-from dataload import Pretrain_Dataset, Rewrite_Dataset, Downstream_Dataset
-from models.autoencoders.adept import ADePT
-from models.downstream_models.bert_downstream import BertDownstream
-from utils import decode_rewritten_rnn, EarlyStopping
-import time
-import json
-from tqdm import tqdm
-from copy import deepcopy
 import pdb
+
+#import warnings
+#warnings.filterwarnings('ignore')
 
 
 class Experiment(ABC):
@@ -47,6 +52,9 @@ class Experiment(ABC):
 
         self.last_checkpoint_path = ss.args.last_checkpoint_path
 
+        self.length_threshold = ss.args.length_threshold
+        self.custom_preprocessor = ss.args.custom_preprocessor
+
         if self.local:
             self.device = torch.device('cpu')
         else:
@@ -68,6 +76,7 @@ class Experiment(ABC):
 
         self.early_stopping = EarlyStopping(self.patience)
 
+        self.two_optimizers = ss.args.two_optimizers
         self.optimizer = None
         self.enc_optimizer = None
         self.dec_optimizer = None
@@ -86,21 +95,29 @@ class Experiment(ABC):
             # for experiments with non-HF-based tokenizers
         self.embed_size = ss.args.embed_size
 
+        self.custom_model_arguments = ss.args.custom_model_arguments
+
         # Private parameters (not all necessary, depending on DP module):
         self.private = ss.args.private
         self.epsilon = ss.args.epsilon
         self.delta = ss.args.delta
         self.clipping_constant = ss.args.clipping_constant
         self.norm_ord = ss.args.l_norm
+        self.dp_module = ss.args.dp_module
         self.dp_mechanism = ss.args.dp_mechanism
         if self.dp_mechanism == 'gaussian' and self.norm_ord == 1:
             print(f"\n+++ WARNING: Using {self.dp_mechanism} noise with norm order {self.norm_ord}. +++\n")
 
+        # Additional settings
         self.no_clipping = ss.args.no_clipping
+
+        self.save_initial_model = ss.args.save_initial_model
 
         self.prepend_labels = ss.args.prepend_labels
 
         self.train_ratio = ss.args.train_ratio
+
+        self.downstream_test_data = ss.args.downstream_test_data
 
         # General variables for experiments
         self.trainable_params = 0
@@ -164,79 +181,130 @@ class Experiment(ABC):
 class PretrainExperiment(Experiment):
     def __init__(self, ss: Settings):
         super().__init__(ss)
-        self.dataset = Pretrain_Dataset(
+        self.dataset = DPRewriteDataset(
                 self.dataset_name, self.asset_dir, self.checkpoint_dir,
-                self.max_seq_len, self.batch_size,
+                self.max_seq_len, self.batch_size, mode=self.mode,
                 embed_type=self.embed_type, train_ratio=self.train_ratio,
                 embed_size=self.embed_size,
                 embed_dir_processed=self.embed_dir_processed,
                 embed_dir_unprocessed=self.embed_dir_unprocessed,
+                transformer_type=self.transformer_type,
                 vocab_size=self.vocab_size,
                 model_type=self.model_type, private=self.private,
                 prepend_labels=self.prepend_labels,
-                local=self.local)
-        self.dataset.load_and_process(
-            custom_train_path=self.custom_train_path,
-            custom_valid_path=self.custom_valid_path,
-            custom_test_path=self.custom_test_path,
-            )
+                length_threshold=self.length_threshold,
+                custom_preprocessor=self.custom_preprocessor,
+                local=self.local,
+                custom_train_path=self.custom_train_path,
+                custom_valid_path=self.custom_valid_path,
+                custom_test_path=self.custom_test_path,
+                downstream_test_data=self.downstream_test_data
+                )
+        self.dataset.load_and_process()
 
         print('Initializing model...')
+        # 'model' classes need to take the following hyperparameters:
+        # embeddings (rnn-based), local, device, epsilon (optional),
+        # embedding type, embedding size (optional), batch size,
+        # max seq len, hidden size (rnn-based? optional?),
+        # vocab size (rnn-based), pad index,
+        # enc out size (optional? most models might have)
         self._init_model()
-            # 'model' classes need to take the following hyperparameters:
-            # embeddings (rnn-based), local, device, epsilon (optional),
-            # embedding type, embedding size (optional), batch size,
-            # max seq len, hidden size (rnn-based? optional?),
-            # vocab size (rnn-based), pad index,
-            # enc out size (optional? most models might have)
 
-    def _init_model(self):
-        if self.model == 'adept':
+    def _init_model_config(self):
+        # Setting the padding index
+        if self.model_type == 'rnn':
             pad_idx = self.dataset.preprocessor.word2idx[
                 self.dataset.preprocessor.PAD]
-            expmod = ADePT
+        else:  # 'transformer'
+            pad_idx = self.dataset.preprocessor.tokenizer.pad_token_id
+
+        self.pad_idx = pad_idx
+
+        # Preparing the general model configuration
+        general_config_dict = {
+            'max_seq_len': self.max_seq_len, 'batch_size': self.batch_size,
+            'mode': self.mode, 'local': self.local, 'device': self.device,
+            'hidden_size': self.hidden_size,
+            'enc_out_size': self.enc_out_size,
+            'embed_size': self.embed_size, 'pad_idx': pad_idx,
+            'transformer_type': self.transformer_type,
+            'private': self.private, 'epsilon': self.epsilon,
+            'delta': self.delta, 'norm_ord': self.norm_ord,
+            'clipping_constant': self.clipping_constant,
+            'dp_mechanism': self.dp_mechanism}
+
+        # Preparing the specific model configuration class
+        model_config = self._get_specific_model_config(general_config_dict)
+        return model_config
+
+    def _get_specific_model_config(self, general_config_dict):
+        if self.model == 'adept':
+            specific_config_dict = {
+                'pretrained_embeddings': self.dataset.preprocessor.embeds,
+                'vocab_size': self.dataset.preprocessor.vocab_size,
+                'no_clipping': self.no_clipping
+                }
+            specific_config = ADePTModelConfig(
+                **general_config_dict, **specific_config_dict
+                )
+        elif self.model in ['custom_rnn', 'custom_transformer']:
+            specific_config_dict = {
+                'custom_config_list': self.custom_model_arguments}
+            specific_config = CustomModelConfig(
+                **general_config_dict, **specific_config_dict
+                )
         else:
             raise NotImplementedError
+        return specific_config
 
-        model = expmod(self.dataset.preprocessor.embeds, self.max_seq_len,
-                       self.batch_size, self.hidden_size,
-                       self.enc_out_size,
-                       self.dataset.preprocessor.vocab_size,
-                       private=self.private, dp_mechanism=self.dp_mechanism,
-                       clipping_constant=self.clipping_constant,
-                       epsilon=self.epsilon, delta=self.delta,
-                       norm_ord=self.norm_ord, no_clipping=self.no_clipping,
-                       embed_size=self.embed_size, pad_idx=pad_idx,
-                       local=self.local, device=self.device)
+    def _get_model_type(self):
+        if self.model == 'adept':
+            model_type = ADePT
+        elif self.model == 'custom_rnn':
+            model_type = CustomModel_RNN
+        elif self.model == 'custom_transformer':
+            model_type = CustomModel_Transformer
+        else:
+            raise NotImplementedError
+        return model_type
+
+    def _init_model(self):
+        model_config = self._init_model_config()
+        model_type = self._get_model_type()
+        model = model_type(model_config)
         self.model = model.to(self.device)
 
-        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        num_params = sum(p.numel()
+                         for p in model.parameters() if p.requires_grad)
         print(f"Num parameters in model: {num_params,}")
         self.stats['num_params'] = num_params
 
         if self.optim_type == 'adam':
-            self.enc_optimizer = optim.Adam(self.model.encoder.parameters(),
-                                            lr=self.learning_rate,
-                                            weight_decay=self.weight_decay)
-            self.dec_optimizer = optim.Adam(self.model.decoder.parameters(),
-                                            lr=self.learning_rate,
-                                            weight_decay=self.weight_decay)
+            optimizer = optim.Adam
         elif self.optim_type == 'sgd':
-            self.enc_optimizer = optim.SGD(self.model.encoder.parameters(),
-                                           lr=self.learning_rate,
-                                           weight_decay=self.weight_decay)
-            self.dec_optimizer = optim.SGD(self.model.decoder.parameters(),
-                                           lr=self.learning_rate,
-                                           weight_decay=self.weight_decay)
+            optimizer = optim.SGD
         else:
             raise Exception('Incorrect optimizer type specified.')
+
+        if self.two_optimizers:
+            self.enc_optimizer = optimizer(
+                self.model.encoder.parameters(), lr=self.learning_rate,
+                weight_decay=self.weight_decay)
+            self.dec_optimizer = optim.Adam(
+                self.model.decoder.parameters(), lr=self.learning_rate,
+                weight_decay=self.weight_decay)
+        else:
+            self.optimizer = optimizer(self.model.parameters(),
+                                       lr=self.learning_rate,
+                                       weight_decay=self.weight_decay)
 
         mem_params = sum([param.nelement()*param.element_size() for param in model.parameters()])
         mem_bufs = sum([buf.nelement()*buf.element_size() for buf in model.buffers()])
         mem = mem_params + mem_bufs  # in bytes
         print("Estimated non-peak memory usage of model (MBs):", mem / 1000000)
 
-        self.loss = nn.CrossEntropyLoss(ignore_index=pad_idx)
+        self.loss = nn.CrossEntropyLoss(ignore_index=self.pad_idx)
 
     def _load_checkpoint(self):
         '''
@@ -247,10 +315,14 @@ class PretrainExperiment(Experiment):
             mod_name = os.path.join(self.checkpoint_dir, 'checkpoint.pt')
             checkpoint = torch.load(mod_name, map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.enc_optimizer.load_state_dict(
+            if self.two_optimizers:
+                self.enc_optimizer.load_state_dict(
                     checkpoint['enc_optimizer_state_dict'])
-            self.dec_optimizer.load_state_dict(
+                self.dec_optimizer.load_state_dict(
                     checkpoint['dec_optimizer_state_dict'])
+            else:
+                self.optimizer.load_state_dict(
+                    checkpoint['optimizer_state_dict'])
             loaded_epoch = checkpoint['checkpoint_epoch'] + 1
                 # Restart training from the next epoch
             early_stopping_counter = checkpoint['checkpoint_early_stopping']
@@ -284,31 +356,48 @@ class PretrainExperiment(Experiment):
                 if idx == iter_size:
                     break
 
-            encoder_input_ids = batch[0]
-            lengths = batch[1]
-            encoder_input_ids = encoder_input_ids.to(self.device)
-            tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
+            if self.model_type == 'rnn':
+                encoder_input_ids = batch[0]
+                lengths = batch[1]
+                encoder_input_ids = encoder_input_ids.to(self.device)
+                inputs = {'input_ids': encoder_input_ids, 'lengths': lengths,
+                          'teacher_forcing_ratio': self.train_teacher_forcing_ratio}
+                tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
+            else:
+                encoder_input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                inputs = {'input_ids': encoder_input_ids,
+                          'attention_mask': attention_mask}
+                tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
 
-            self.enc_optimizer.zero_grad()
-            self.dec_optimizer.zero_grad()
+            if self.two_optimizers:
+                self.enc_optimizer.zero_grad()
+                self.dec_optimizer.zero_grad()
+            else:
+                self.optimizer.zero_grad()
 
             loss = 0
 
-            outputs = self.model(
-                    encoder_input_ids, lengths,
-                    teacher_forcing_ratio=self.train_teacher_forcing_ratio)
+            outputs = self.model(**inputs)
 
             loss = self.loss(outputs, tgt)
 
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(),
-                                           max_norm=1)
-            torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(),
-                                           max_norm=1)
+            if self.two_optimizers:
+                torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(),
+                                               max_norm=1)
+                torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(),
+                                               max_norm=1)
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                               max_norm=1)
 
-            self.enc_optimizer.step()
-            self.dec_optimizer.step()
+            if self.two_optimizers:
+                self.enc_optimizer.step()
+                self.dec_optimizer.step()
+            else:
+                self.optimizer.step()
 
             epoch_loss += loss.item()
 
@@ -317,14 +406,16 @@ class PretrainExperiment(Experiment):
                         encoder_input_ids.shape[0],
                         encoder_input_ids.shape[1] - 1)
 
-                decoded_text = decode_rewritten_rnn(
+                decoded_text = decode_rewritten(
                         preds[0].unsqueeze(0),
                         self.dataset.preprocessor,
-                        remove_special_tokens=False)[0]
-                original = decode_rewritten_rnn(
-                        batch[0][0][1:].unsqueeze(0),
+                        remove_special_tokens=False,
+                        model_type=self.model_type)[0]
+                original = decode_rewritten(
+                        encoder_input_ids[0][1:].unsqueeze(0),
                         self.dataset.preprocessor,
-                        remove_special_tokens=False)[0]
+                        remove_special_tokens=False,
+                        model_type=self.model_type)[0]
 
                 print("TRAIN ORIGINAL: ", original)
                 print("TRAIN PRED: ", decoded_text)
@@ -348,34 +439,50 @@ class PretrainExperiment(Experiment):
                     if idx == iter_size:
                         break
 
-                encoder_input_ids = batch[0]
-                lengths = batch[1]
-                encoder_input_ids = encoder_input_ids.to(self.device)
+                if self.model_type == 'rnn':
+                    encoder_input_ids = batch[0]
+                    lengths = batch[1]
+                    encoder_input_ids = encoder_input_ids.to(self.device)
+                    inputs = {'input_ids': encoder_input_ids, 'lengths': lengths,
+                              'teacher_forcing_ratio': 0.0}
+                    tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
+                else:
+                    encoder_input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    inputs = {'input_ids': encoder_input_ids,
+                              'attention_mask': attention_mask}
+                    tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
+
+                if self.two_optimizers:
+                    self.enc_optimizer.zero_grad()
+                    self.dec_optimizer.zero_grad()
+                else:
+                    self.optimizer.zero_grad()
 
                 loss = 0
 
-                tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
+                outputs = self.model(**inputs)
 
-                outputs = self.model(
-                        encoder_input_ids, lengths,
-                        teacher_forcing_ratio=0.0)
                 loss = self.loss(outputs, tgt)
+                loss = loss.item()
 
-                epoch_loss += loss.item()
+                epoch_loss += loss
 
                 if idx == 0 and not final:
                     preds = torch.max(outputs, dim=1).indices.view(
                             encoder_input_ids.shape[0],
                             encoder_input_ids.shape[1] - 1)
 
-                    decoded_text = decode_rewritten_rnn(
+                    decoded_text = decode_rewritten(
                             preds[0].unsqueeze(0),
                             self.dataset.preprocessor,
-                            remove_special_tokens=False)[0]
-                    original = decode_rewritten_rnn(
-                            batch[0][0][1:].unsqueeze(0),
+                            remove_special_tokens=False,
+                            model_type=self.model_type)[0]
+                    original = decode_rewritten(
+                            encoder_input_ids[0][1:].unsqueeze(0),
                             self.dataset.preprocessor,
-                            remove_special_tokens=False)[0]
+                            remove_special_tokens=False,
+                            model_type=self.model_type)[0]
 
                     print("VALID ORIGINAL: ", original)
                     print("VALID PRED: ", decoded_text)
@@ -387,12 +494,14 @@ class PretrainExperiment(Experiment):
                             encoder_input_ids.shape[0],
                             encoder_input_ids.shape[1] - 1)
 
-                    decoded_text = decode_rewritten_rnn(
+                    decoded_text = decode_rewritten(
                             preds, self.dataset.preprocessor,
-                            remove_special_tokens=True)
-                    original = decode_rewritten_rnn(
-                            batch[0], self.dataset.preprocessor,
-                            remove_special_tokens=True)
+                            remove_special_tokens=True,
+                            model_type=self.model_type)
+                    original = decode_rewritten(
+                            encoder_input_ids, self.dataset.preprocessor,
+                            remove_special_tokens=True,
+                            model_type=self.model_type)
 
                     for batch_idx in range(len(decoded_text)):
                         with open(self.temp_valid_file_preds, 'a', encoding='utf-8') as f:
@@ -421,31 +530,21 @@ class PretrainExperiment(Experiment):
             print(f'Epoch: {epoch+1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s')
             print(f'\tTrain Loss: {train_loss:.3f}')
             print(f'\tVal. Loss: {valid_loss:.3f}')
-            checkpoint_name = os.path.join(self.checkpoint_dir, 'checkpoint.pt')
-            checkpoint_dict = {
-                'checkpoint_epoch': epoch,
-                'checkpoint_early_stopping': self.early_stopping.counter,
-                'model_state_dict': self.model.state_dict(),
-                'enc_optimizer_state_dict': self.enc_optimizer.state_dict(),
-                'dec_optimizer_state_dict': self.dec_optimizer.state_dict()
-                }
+
+            # Saving checkpoint
+            early_stop = self._save_checkpoint_and_early_stopping(
+                epoch, valid_loss, early_stop=self.early_stop)
+            if early_stop:
+                break
+
+            # Updating stats dictionary
             self.stats[f'pretrain_epoch_mins_{epoch}'] = epoch_mins
             self.stats[f'pretrain_epoch_secs_{epoch}'] = epoch_secs
             self.stats[f'pretrain_train_loss_{epoch}'] = train_loss
             self.stats[f'pretrain_valid_loss_{epoch}'] = valid_loss
 
             # Saving stats dictionary
-            with open(os.path.join(self.exp_output_dir, 'stats.json'), 'w',
-                      encoding='utf-8') as f:
-                json.dump(self.stats, f, ensure_ascii=False, indent=4)
-
-            if self.early_stop:
-                self.early_stopping(valid_loss, checkpoint_dict, checkpoint_name)
-                if self.early_stopping.early_stop:
-                    break
-            else:
-                # If no early stopping, just save every epoch
-                torch.save(checkpoint_dict, checkpoint_name)
+            self._save_stats_dict()
 
         # Only calculating BERTScore once at the end, and if running on GPU,
         # since it takes longer
@@ -453,9 +552,38 @@ class PretrainExperiment(Experiment):
             epoch, bert_score=self.run_bert_score)
 
         # Saving stats dictionary one last time
+        self._save_stats_dict()
+
+    def _save_stats_dict(self):
         with open(os.path.join(self.exp_output_dir, 'stats.json'), 'w',
                   encoding='utf-8') as f:
             json.dump(self.stats, f, ensure_ascii=False, indent=4)
+
+    def _save_checkpoint_and_early_stopping(self, epoch, valid_loss, early_stop=True):
+        checkpoint_name = os.path.join(self.checkpoint_dir, 'checkpoint.pt')
+        if self.two_optimizers:
+            checkpoint_dict = {
+                'checkpoint_epoch': epoch,
+                'checkpoint_early_stopping': self.early_stopping.counter,
+                'model_state_dict': self.model.state_dict(),
+                'enc_optimizer_state_dict': self.enc_optimizer.state_dict(),
+                'dec_optimizer_state_dict': self.dec_optimizer.state_dict()
+                }
+        else:
+            checkpoint_dict = {
+                'checkpoint_epoch': epoch,
+                'checkpoint_early_stopping': self.early_stopping.counter,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                }
+
+        # Early stopping
+        if early_stop:
+            self.early_stopping(valid_loss, checkpoint_dict, checkpoint_name)
+            return self.early_stopping.early_stop
+        else:
+            torch.save(checkpoint_dict, checkpoint_name)
+            return False
 
     def _set_up_evaluation_files(self):
         self.temp_valid_file_original = os.path.join(
@@ -531,6 +659,12 @@ class PretrainExperiment(Experiment):
         # Load an existing model checkpoint, if available
         loaded_epoch, early_stopping_counter = self._load_checkpoint()
 
+        if self.save_initial_model and loaded_epoch == 0:
+            # For convenient comparison of non-pretrained models
+            print("Saving initial checkpoint of model...")
+            self._save_checkpoint_and_early_stopping(-1, np.inf,
+                                                     early_stop=False)
+
         # Setting up files for later evaluation of outputs
         self._set_up_evaluation_files()
 
@@ -546,44 +680,91 @@ class RewriteExperiment(Experiment):
         # Whether to include original dataset in the rewritten dataframe
         self.include_original = ss.args.include_original
 
-        self.dataset = Rewrite_Dataset(
+        self.dataset = DPRewriteDataset(
                 self.dataset_name, self.asset_dir, self.checkpoint_dir,
-                self.max_seq_len,
-                self.batch_size, embed_type=self.embed_type,
-                embed_size=self.embed_size,
+                self.max_seq_len, self.batch_size, mode=self.mode,
+                embed_type=self.embed_type, embed_size=self.embed_size,
                 embed_dir_processed=self.embed_dir_processed,
                 embed_dir_unprocessed=self.embed_dir_unprocessed,
+                transformer_type=self.transformer_type,
                 vocab_size=self.vocab_size,
                 model_type=self.model_type, private=self.private,
-                prepend_labels=self.prepend_labels, local=self.local,
-                last_checkpoint_path=self.last_checkpoint_path)
-        self.dataset.load_and_process(
-            custom_train_path=self.custom_train_path,
-            custom_valid_path=self.custom_valid_path,
-            custom_test_path=self.custom_test_path)
+                prepend_labels=self.prepend_labels,
+                length_threshold=self.length_threshold,
+                custom_preprocessor=self.custom_preprocessor, local=self.local,
+                last_checkpoint_path=self.last_checkpoint_path,
+                custom_train_path=self.custom_train_path,
+                custom_valid_path=self.custom_valid_path,
+                custom_test_path=self.custom_test_path,
+                downstream_test_data=self.downstream_test_data
+                )
+        self.dataset.load_and_process()
 
         print('Initializing model...')
         self._init_model()
 
-    def _init_model(self):
-        if self.model == 'adept':
+    def _init_model_config(self):
+        # Setting the padding index
+        if self.model_type == 'rnn':
             pad_idx = self.dataset.preprocessor.word2idx[
                 self.dataset.preprocessor.PAD]
-            expmod = ADePT
+        else:  # 'transformer'
+            pad_idx = self.dataset.preprocessor.tokenizer.pad_token_id
+
+        self.pad_idx = pad_idx
+
+        # Preparing the general model configuration
+        general_config_dict = {
+            'max_seq_len': self.max_seq_len, 'batch_size': self.batch_size,
+            'mode': self.mode, 'local': self.local, 'device': self.device,
+            'hidden_size': self.hidden_size,
+            'enc_out_size': self.enc_out_size,
+            'embed_size': self.embed_size, 'pad_idx': pad_idx,
+            'transformer_type': self.transformer_type,
+            'private': self.private, 'epsilon': self.epsilon,
+            'delta': self.delta, 'norm_ord': self.norm_ord,
+            'clipping_constant': self.clipping_constant,
+            'dp_mechanism': self.dp_mechanism}
+
+        # Preparing the specific model configuration class
+        model_config = self._get_specific_model_config(general_config_dict)
+        return model_config
+
+    def _get_specific_model_config(self, general_config_dict):
+        if self.model == 'adept':
+            specific_config_dict = {
+                'pretrained_embeddings': self.dataset.preprocessor.embeds,
+                'vocab_size': self.dataset.preprocessor.vocab_size,
+                'no_clipping': self.no_clipping
+                }
+            specific_config = ADePTModelConfig(
+                **general_config_dict, **specific_config_dict
+                )
+        elif self.model in ['custom_rnn', 'custom_transformer']:
+            specific_config_dict = {
+                'custom_config_list': self.custom_model_arguments}
+            specific_config = CustomModelConfig(
+                **general_config_dict, **specific_config_dict
+                )
         else:
             raise NotImplementedError
+        return specific_config
 
-        model = expmod(self.dataset.preprocessor.embeds, self.max_seq_len,
-                       self.batch_size, self.hidden_size,
-                       self.enc_out_size,
-                       self.dataset.preprocessor.vocab_size,
-                       private=self.private, dp_mechanism=self.dp_mechanism,
-                       clipping_constant=self.clipping_constant,
-                       epsilon=self.epsilon, delta=self.delta,
-                       norm_ord=self.norm_ord, no_clipping=self.no_clipping,
-                       embed_size=self.embed_size, pad_idx=pad_idx,
-                       local=self.local, device=self.device)
+    def _get_model_type(self):
+        if self.model == 'adept':
+            model_type = ADePT
+        elif self.model == 'custom_rnn':
+            model_type = CustomModel_RNN
+        elif self.model == 'custom_transformer':
+            model_type = CustomModel_Transformer
+        else:
+            raise NotImplementedError
+        return model_type
 
+    def _init_model(self):
+        model_config = self._init_model_config()
+        model_type = self._get_model_type()
+        model = model_type(model_config)
         self.model = model.to(self.device)
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -594,7 +775,7 @@ class RewriteExperiment(Experiment):
         mem = mem_params + mem_bufs  # in bytes
         print("Estimated non-peak memory usage of model (MBs):", mem / 1000000)
 
-        self.loss = nn.CrossEntropyLoss(ignore_index=pad_idx)
+        self.loss = nn.CrossEntropyLoss(ignore_index=self.pad_idx)
 
     def _load_checkpoint(self):
         checkpoint = torch.load(self.last_checkpoint_path,
@@ -614,49 +795,68 @@ class RewriteExperiment(Experiment):
                 epoch_loss = 0
 
                 for idx, batch in tqdm(enumerate(iterator)):
-                    encoder_input_ids = batch[0]
-                    lengths = batch[1]
-                    encoder_input_ids = encoder_input_ids.to(self.device)
+
+                    if self.model_type == 'rnn':
+                        encoder_input_ids = batch[0]
+                        lengths = batch[1]
+                        true_labels = batch[2]
+                        encoder_input_ids = encoder_input_ids.to(self.device)
+                        inputs = {'input_ids': encoder_input_ids, 'lengths': lengths,
+                                  'teacher_forcing_ratio': 0.0}
+                        tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
+                    else:
+                        encoder_input_ids = batch['input_ids'].to(self.device)
+                        attention_mask = batch['attention_mask'].to(self.device)
+                        true_labels = batch['labels'].to(self.device)
+                        inputs = {'input_ids': encoder_input_ids,
+                                  'attention_mask': attention_mask}
+                        tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
 
                     loss = 0
+                    outputs = self.model(**inputs)
 
-                    tgt = deepcopy(encoder_input_ids)[:, 1:].reshape(-1)
-
-                    outputs = self.model(
-                            encoder_input_ids, lengths,
-                            teacher_forcing_ratio=0.0)
-
-                    loss = self.loss(outputs, tgt)
-
-                    outputs_reshaped = outputs.view(
-                            encoder_input_ids.shape[0],
-                            encoder_input_ids.shape[1] - 1, outputs.shape[-1])
-                    preds = torch.max(outputs_reshaped, dim=2).indices
+                    if self.model_type == 'rnn':
+                        loss = self.loss(outputs, tgt)
+                        loss = loss.item()
+                        outputs_reshaped = outputs.view(
+                                encoder_input_ids.shape[0],
+                                encoder_input_ids.shape[1] - 1, outputs.shape[-1])
+                        preds = torch.max(outputs_reshaped, dim=2).indices
+                    else:
+                        preds = outputs
 
                     if self.prepend_labels:
                         predicted_labels = preds[:, 0]
                         preds = preds[:, 1:]
                         encoder_input_ids = encoder_input_ids[:, 2:]
-                        output_labels = decode_rewritten_rnn(
+                        output_labels = decode_rewritten(
                             predicted_labels.unsqueeze(0),
                             self.dataset.preprocessor,
                             remove_special_tokens=False,
-                            labels=True)[0]
-                        true_labels = decode_rewritten_rnn(
-                            batch[2].unsqueeze(0),
+                            labels=True, model_type=self.model_type)[0]
+                        true_labels = decode_rewritten(
+                            true_labels.unsqueeze(0),
                             self.dataset.preprocessor,
                             remove_special_tokens=False,
-                            labels=True)[0]
+                            labels=True, model_type=self.model_type)[0]
                     else:
-                        output_labels = batch[2]
-                        true_labels = batch[2]
+                        if self.model_type == 'rnn':
+                            output_labels = true_labels
+                        else:
+                            true_labels = [
+                                self.dataset.preprocessor.lab_int2str[lab.item()]
+                                for lab in true_labels
+                                ]
+                            output_labels = true_labels
 
-                    decoded_text = decode_rewritten_rnn(
+                    decoded_text = decode_rewritten(
                             preds, self.dataset.preprocessor,
-                            remove_special_tokens=True)
-                    original = decode_rewritten_rnn(
+                            remove_special_tokens=True,
+                            model_type=self.model_type)
+                    original = decode_rewritten(
                             encoder_input_ids, self.dataset.preprocessor,
-                            remove_special_tokens=True)
+                            remove_special_tokens=True,
+                            model_type=self.model_type)
 
                     for batch_idx in range(len(decoded_text)):
                         current_data_idx = (idx * self.batch_size) + batch_idx
@@ -664,6 +864,12 @@ class RewriteExperiment(Experiment):
                             decoded_text[batch_idx] = ' '
                         current_data_point = decoded_text[batch_idx]
                         current_data_original = original[batch_idx]
+#                        if isinstance(output_labels, torch.Tensor):
+#                            current_data_label = output_labels[batch_idx].item()
+#                            current_data_original_label = true_labels[batch_idx].item()
+#                        else:
+#                            current_data_label = output_labels[batch_idx]
+#                            current_data_original_label = true_labels[batch_idx]
                         current_data_label = output_labels[batch_idx]
                         current_data_original_label = true_labels[batch_idx]
                         rewritten_df["text"].loc[current_data_idx] =\
@@ -675,7 +881,7 @@ class RewriteExperiment(Experiment):
                         rewritten_df["original_label"].loc[current_data_idx] = \
                             current_data_original_label
 
-                    epoch_loss += loss.item()
+                    epoch_loss += loss
                 final_loss = epoch_loss / len(iterator)
                 print(f"{split_name} set: | Rewrite loss: {final_loss} |")
 
@@ -782,9 +988,9 @@ class DownstreamExperiment(Experiment):
         self.train_f1s = []
         self.valid_f1s = []
 
-        self.dataset = Downstream_Dataset(
+        self.dataset = DPRewriteDataset(
                 self.dataset_name, self.asset_dir, self.checkpoint_dir,
-                self.max_seq_len, self.batch_size,
+                self.max_seq_len, self.batch_size, mode=self.mode,
                 train_ratio=self.train_ratio, embed_type=self.embed_type,
                 embed_size=self.embed_size,
                 embed_dir_processed=self.embed_dir_processed,
@@ -793,12 +999,16 @@ class DownstreamExperiment(Experiment):
                 model_type=self.model_type, private=self.private,
                 prepend_labels=self.prepend_labels,
                 transformer_type=self.transformer_type,
-                local=self.local)
-        self.dataset.load_and_process(
-            custom_train_path=self.custom_train_path,
-            custom_valid_path=self.custom_valid_path,
-            custom_test_path=self.custom_test_path,
-            )
+                length_threshold=self.length_threshold,
+                custom_preprocessor=self.custom_preprocessor,
+                local=self.local,
+                custom_train_path=self.custom_train_path,
+                custom_valid_path=self.custom_valid_path,
+                custom_test_path=self.custom_test_path,
+                downstream_test_data=self.downstream_test_data
+                )
+
+        self.dataset.load_and_process()
 
         self.output_dim = self.dataset.preprocessor.num_labels
 
@@ -811,8 +1021,8 @@ class DownstreamExperiment(Experiment):
         else:
             raise NotImplementedError
 
-        model = expmod(output_dim=self.output_dim, avg_hs_output=True,
-                       transformer_type=self.transformer_type,
+        model = expmod(output_dim=self.output_dim, avg_hs_output=False,
+                       dropout=0.8, transformer_type=self.transformer_type,
                        hidden_dim=768, local=self.local,
                        device=self.device)
         self.model = model.to(self.device)
@@ -1187,3 +1397,6 @@ class DownstreamExperiment(Experiment):
             test_loss, test_A, test_P, test_R, test_F1 =\
                 self.evaluate(None, test=True)
         self.output_results(test_loss, test_A, test_F1)
+        print("Final test loss:", test_loss)
+        print("Final test accuracy:", test_A)
+        print("Final test F1:", test_F1)

@@ -83,7 +83,12 @@ All available datasets will be downloaded and preprocessed automatically to fit 
 | `atis` | Airline Travel Information Systems (ATIS) dataset, originally consisting of audio recordings and manual transcripts related to flight reservations, meant for the tasks of intent detection and slot filling. Here we include the manual transcripts and intent labels of the dataset. Split: 4,478 train, 500 development and 893 test examples. | Original source: https://github.com/Microsoft/CNTK/tree/master/Examples/LanguageUnderstanding/ATIS/Data<br>Paper citation: [Dahl et al., 1994](https://aclanthology.org/H94-1010.pdf) |
 | `snips_2016` | Dataset collected for the Snips personal assistant, used for an NLU benchmark from 2016. No pre-defined dataset split, 328 examples in total. | Original source: https://github.com/sonos/nlu-benchmark/tree/master/2016-12-built-in-intents<br>Fetched from: https://huggingface.co/datasets/snips_built_in_intents |
 | `snips_2017` | Dataset collected from the Snips personal voice assistant, used for an NLU benchmark from 2017. Split: 13,084 train, 700 development and 700 test examples. | Original source: https://github.com/sonos/nlu-benchmark/tree/master/2017-06-custom-intent-engines<br>Paper citation: [Coucke et al., 2018](https://arxiv.org/abs/1805.10190) |
-| `wikipedia` | Currently using the Wikipedia dump from May 1, 2020. | https://huggingface.co/datasets/wikipedia |
+| `drugscom_reviews_rating` | Original dataset consists of patient reviews on specific drugs and patients' related conditions, along with a rating out of 10 stars on overall satisfaction. Processed here to only include 'review' and 'rating' columns from the original dataset. Split: 161,297 train, 53,766 test examples. | Source: https://archive.ics.uci.edu/ml/datasets/Drug+Review+Dataset+%28Drugs.com%29<br>Paper citation: [Gräßer et al. 2018](https://dl.acm.org/doi/10.1145/3194658.3194677) |
+| `drugscom_reviews_condition` | Original dataset consists of patient reviews on specific drugs and patients' related conditions, along with a rating out of 10 stars on overall satisfaction. Processed here to only include 'review' and 'condition' columns from the original dataset. Split: 161,297 train, 53,766 test examples. | Source: https://archive.ics.uci.edu/ml/datasets/Drug+Review+Dataset+%28Drugs.com%29<br>Paper citation: [Gräßer et al. 2018](https://dl.acm.org/doi/10.1145/3194658.3194677) |
+| `reddit_mental_health` | Dataset consisting of posts from 28 subreddits from 2018-2020, with 15 of the subreddits being from mental health support groups. Processed here to only include 'subreddit' and 'post' columns from the original dataset. Split: 6,467,760 train. | Source: https://zenodo.org/record/3941387<br>Paper citation: [Low et al. 2020](https://www.jmir.org/2020/10/e22635/) |
+| `amazon_reviews_books` | Large dataset consisting of customer reviews on products from Amazon.com from 1995 until 2015. Here the subset 'Books_v1_00' is used, consisting of reviews in the Books product category. Processed here to only include 'star_rating' and 'review_body' columns. Split: 10,319,090 train. | Original source: https://s3.amazonaws.com/amazon-reviews-pds/readme.html <br>Fetched from: https://huggingface.co/datasets/amazon_us_reviews |
+| `wikipedia` | Currently using the Wikipedia dump from May 1, 2020. | Fetched from: https://huggingface.co/datasets/wikipedia |
+| `openwebtext` | Dataset created as an open-source version of WebText from OpenAI. | Original source: https://skylion007.github.io/OpenWebTextCorpus/ <br>Fetched from: https://huggingface.co/datasets/openwebtext |
 
 ### Custom Datasets
 
@@ -111,7 +116,24 @@ If you want to use your **own dataset**:
 
 It is also possible to include a custom model for the experiments. The procedure is as follows:
 
-...
+- Depending on whether the model is RNN- or Transformer-based, fill out the `CustomModel_RNN` or `CustomModel_Transformer` classes, respectively. These can be found in `models/autoencoders/custom.py`.
+- Alternatively, a user-made model class can inherit from these custom classes.
+- The expected inputs/outputs of the `forward` method are specified in the docstrings of these custom model classes.
+  - `CustomModel_RNN`:
+    - Input: Dictionary of input values with key-value pairs as follows:
+      - `input_ids`: `torch.LongTensor` (`batch_size` X `seq_len`)
+      - `lengths`: `torch.LongTensor` (`batch_size`)
+      - `teacher_forcing_ratio`: `float`
+    - Return:
+      - `torch.DoubleTensor` (`batch_size` X `seq_len-1` X `vocab_size+4`)
+  - `CustomModel_Transformer`: 
+    - Input: Dictionary of input values with key-value pairs as follows:
+      - `input_ids`: `torch.LongTensor` (`batch_size` X `seq_len`)
+      - `attention_mask`: `torch.LongTensor` (`batch_size` X `seq_len`)
+    - Return:
+      - `torch.DoubleTensor` (`batch_size` X `seq_len-1` X `vocab_size`)
+- Any new arguments required for the model that are not currently part of the framework can be added with the CMD argument `--custom_model_arguments`, which will be available as a list under the custom model class `self.config.custom_config_list` variable.
+  - E.g. `--custom_model_arguments alpha beta gamma` --> `self.config.custom_config_list == ['alpha', 'beta', 'gamma']`
 
 ## Project Structure
 
@@ -120,7 +142,7 @@ It is also possible to include a custom model for the experiments. The procedure
     - ``autoencoders`` contains all (PyTorch) autoencoder models that are used to privatize the data, each in its own python file.
     - ``downstream_models`` contains all (PyTorch) models that tackle a downstream task, each in its own python file. They can be used with original or rewritten data.
 - ``sample_scripts`` contains tests for different datasets and experiments.
-- ``download.py`` can be used to download datasets and embeddings to the assets folder **(currently not used)**.
+- ``download.py`` can be used to download datasets and embeddings to the assets folder.
 - ``dataload.py`` is the main dataloading script which prepares existing and custom datasets.
 - ``experiments.py`` contains three types of "experiments" and the main training/evaluation loops for the framework.
 - ``main.py`` can be executed from the command line with arguments to run experiments (see Quick Start above).
