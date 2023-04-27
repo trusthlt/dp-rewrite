@@ -18,7 +18,7 @@ Please use the following citation
                  Linguistics},
     booktitle = {Proceedings of the 29th International Conference
                  on Computational Linguistics},
-    pages     = {(to appear)},
+    pages     = {2927--2933},
     year      = {2022},
     address   = {Gyeongju, Republic of Korea}
 }
